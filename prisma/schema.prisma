@@ -1,0 +1,355 @@
+// =============================================================================
+// Agent 智能体平台 · Prisma Schema (Prisma 7 + Supabase 适配版)
+// 对应规格 docs/agent-platform-spec.md §4.2
+// =============================================================================
+
+// Prisma 7：必须用 prisma-client 生成器(非旧的 prisma-client-js)，且 output 必填。
+// 客户端生成到项目根 generated/prisma，代码里用 @/generated/prisma/client 导入。
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+// Prisma 7：datasource 里不再放 url/directUrl(已废弃)，连接串移到 prisma.config.ts。
+// 这里只声明数据库类型。
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------------------------------------------------------
+// 枚举
+// -----------------------------------------------------------------------------
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Visibility {
+  PRIVATE
+  UNLISTED
+  PUBLIC
+}
+
+enum AgentStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum DocStatus {
+  PENDING
+  PROCESSING
+  READY
+  FAILED
+}
+
+enum MessageRole {
+  SYSTEM
+  USER
+  ASSISTANT
+  TOOL
+}
+
+// -----------------------------------------------------------------------------
+// 账户
+// -----------------------------------------------------------------------------
+
+/// 平台用户。MVP 阶段用 Supabase Auth 管认证，本表存业务资料与角色。
+/// 与 Supabase Auth 的 auth.users 通过 id(cuid 自生成) 关联 —— 注册时在 trigger/回调里插入本表。
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  avatarUrl String?
+  role      Role     @default(USER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agents  Agent[]
+  threads Thread[]
+  usage   UsageRecord[]
+
+  /// 社交互动：我点赞/收藏的 Agent
+  agentLikes     AgentLike[]
+  agentFavorites AgentFavorite[]
+
+  /// 评论相关
+  comments     Comment[]
+  commentLikes CommentLike[]
+
+  @@index([email])
+}
+
+// -----------------------------------------------------------------------------
+// Agent(核心实体)
+// -----------------------------------------------------------------------------
+
+/// 一个可配置的 AI 智能体：人设 + 模型参数 + 工具 + 可选知识库。
+model Agent {
+  id        String @id @default(cuid())
+  ownerId   String
+  owner     User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name      String
+  description String? @db.Text
+  avatarUrl  String?
+
+  /// 系统提示词，支持 Markdown，上限 4000 字符
+  systemPrompt String? @db.Text
+
+  /// 模型标识，MVP 默认走 DeepSeek: deepseek-chat / deepseek-reasoner
+  model         String  @default("deepseek-chat")
+  temperature   Float   @default(0.7)
+  topP          Float   @default(1)
+  maxTokens     Int     @default(2048)
+
+  /// 启用的工具 key 列表，如 ["web_search","calculator","knowledge_search"]
+  tools Json?
+
+  visibility Visibility  @default(PRIVATE)
+  shareSlug  String?     @unique
+  status     AgentStatus @default(ACTIVE)
+
+  /// 是否启用 RAG 知识库检索。关闭时即使有文档也不检索，对话走原 systemPrompt。
+  enableKnowledge Boolean @default(true)
+
+  /// 软删除：删除后不可见，DB 保留 30 天可恢复
+  deletedAt          DateTime?
+  conversationsCount Int @default(0)
+
+  /// 社交互动计数（冗余字段，避免每次都查 COUNT(*)）
+  likeCount      Int @default(0)
+  favoriteCount  Int @default(0)
+  shareCount     Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  knowledgeBases KnowledgeBase[]
+  threads        Thread[]
+  tags           AgentTag[]
+  likes          AgentLike[]
+  favorites      AgentFavorite[]
+  comments       Comment[]
+
+  @@index([ownerId, status])
+  @@index([visibility, status])
+}
+
+// -----------------------------------------------------------------------------
+// 知识库与 RAG
+// -----------------------------------------------------------------------------
+
+model KnowledgeBase {
+  id        String     @id @default(cuid())
+  agentId   String
+  agent     Agent      @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  name      String
+  documents Document[]
+  createdAt DateTime   @default(now())
+}
+
+model Document {
+  id         String        @id @default(cuid())
+  kbId       String
+  kb         KnowledgeBase @relation(fields: [kbId], references: [id], onDelete: Cascade)
+  title      String
+  /// Supabase Storage 里的对象 key(替代规格中的 R2)
+  sourceUrl  String?
+  mimeType   String
+  sizeBytes  Int
+  status     DocStatus     @default(PENDING)
+  chunkCount Int           @default(0)
+  /// 处理失败时的错误原因（成功/处理中为空）
+  error      String?       @db.Text
+  embeddings Embedding[]
+  createdAt  DateTime      @default(now())
+
+  @@index([kbId, status])
+}
+
+/// 文档切片后的向量。pgvector 列用 Unsupported 声明，Prisma 不直接操作，
+/// 检索时用 $queryRaw 原始 SQL 走 pgvector。
+/// 维度 1024 对应硅基流动 BAAI/bge-large-zh-v1.5；若换 embedding 模型需同步调整。
+model Embedding {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  chunkIndex Int
+  content    String   @db.Text
+  /// pgvector 向量列，迁移后需手动 CREATE EXTENSION vector 与索引
+  embedding  Unsupported("vector(1024)")
+  createdAt  DateTime @default(now())
+
+  @@index([documentId])
+}
+
+// -----------------------------------------------------------------------------
+// 会话与消息
+// -----------------------------------------------------------------------------
+
+model Thread {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentId   String
+  agent     Agent     @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  title     String    @default("新对话")
+  messages  Message[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId, updatedAt])
+  @@index([agentId])
+}
+
+model Message {
+  id         String       @id @default(cuid())
+  threadId   String
+  thread     Thread       @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  role       MessageRole
+  content    String       @db.Text
+  /// tool calling 记录
+  toolCalls  Json?
+  tokenCount Int?
+  createdAt  DateTime     @default(now())
+
+  @@index([threadId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// 用量统计
+// -----------------------------------------------------------------------------
+
+/// 每次对话结束落一条，记录 token 消耗与成本，供用量看板查询。
+model UsageRecord {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentId          String?
+  threadId         String?
+  /// deepseek / openai / anthropic ...
+  provider         String
+  model            String
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+  costUsd          Float?
+  createdAt        DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([agentId, createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// 标签(探索广场用)
+// -----------------------------------------------------------------------------
+
+model Tag {
+  id     String     @id @default(cuid())
+  name   String     @unique
+  agents AgentTag[]
+}
+
+model AgentTag {
+  agentId String
+  tagId   String
+  agent   Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  tag     Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([agentId, tagId])
+}
+
+// -----------------------------------------------------------------------------
+// 社交互动(点赞 / 收藏)
+// -----------------------------------------------------------------------------
+
+/// 用户对 Agent 的点赞记录。
+/// 联合主键 @@id([userId, agentId]) 保证同一个人对同一个 Agent 只能有一条记录——
+/// 数据库层面防重复，不需要代码层去重检查。
+model AgentLike {
+  userId    String
+  agentId   String
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent     Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, agentId])
+  @@index([agentId])
+}
+
+/// 用户对 Agent 的收藏记录。结构跟 AgentLike 完全一样。
+model AgentFavorite {
+  userId    String
+  agentId   String
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agent     Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, agentId])
+  @@index([agentId])
+}
+
+// -----------------------------------------------------------------------------
+// 社交互动(评论 + 评论点赞)
+// -----------------------------------------------------------------------------
+
+/// 用户对公开 Agent 的评论。
+///
+/// parentId 设计：
+/// - null → 顶级评论（直接评论 Agent）
+/// - 非 null → 回复，parentId 指向被回复的顶级评论
+///
+/// 约束：parentId 只能指向 parentId=null 的评论（两层结构，不允许回复回复）。
+/// 这个约束在 API 层校验（查 parent 的 parentId 是否为 null），
+/// 数据库层面无法直接表达"外键必须满足某条件"，用应用逻辑保证。
+///
+/// deletedAt：软删除。删除后不显示内容（前端显示"该评论已删除"），
+/// 但保留楼层结构，让回复不会因为父评论删除而错位。
+model Comment {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  agentId   String
+  agent     Agent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  /// 评论内容，前端限 500 字，DB 用 Text 类型不设硬限
+  content   String   @db.Text
+
+  /// 自关联：null=顶级评论，非 null=回复
+  /// 被回复的必须是顶级评论(parentId=null)，由 API 层校验
+  parentId  String?
+
+  /// 冗余计数，避免每次查 COUNT(*)
+  likeCount Int      @default(0)
+
+  /// 软删除时间戳
+  deletedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// 该评论下的回复（只有顶级评论才有）
+  replies Comment[]  @relation("CommentReplies")
+  /// 如果是回复，指向被回复的顶级评论
+  parent   Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+
+  /// 点赞记录
+  likes    CommentLike[]
+
+  @@index([agentId, createdAt])
+  @@index([parentId])
+  @@index([userId])
+}
+
+/// 用户对评论的点赞记录。联合主键防重复。
+model CommentLike {
+  userId    String
+  commentId String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  comment   Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, commentId])
+  @@index([commentId])
+}
