@@ -48,6 +48,9 @@ next-env.d.ts
 AGENTS.md
 CLAUDE.md
 
+# 内部文档（规划/面试准备/设计稿，不公开）
+docs/
+
 nul
 verify_err.html
 qa-artifacts/
