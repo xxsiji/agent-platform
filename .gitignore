@@ -44,8 +44,10 @@ next-env.d.ts
 # prisma generated client (Prisma 7 不再生成进 node_modules)
 /generated
 
-# local junk / throwaway artifacts (not for deploy)
-.next_bak/
+# AI agent 规则文件（开发工具，不进仓库）
+AGENTS.md
+CLAUDE.md
+
 nul
 verify_err.html
 qa-artifacts/
