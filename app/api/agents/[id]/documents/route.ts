@@ -127,9 +127,6 @@ export async function POST(
 
   const buffer = Buffer.from(await file.arrayBuffer());
 
-  // a. 确保 bucket 存在
-  await ensureDocumentsBucket();
-
   // c. 获取或自动创建知识库（MVP 每个 Agent 一个 KB）
   let kb = agent.knowledgeBases[0];
   if (!kb) {
@@ -138,40 +135,61 @@ export async function POST(
     });
   }
 
-  // a. 上传文件到 Storage（路径用 agentId/kbId/时间戳-文件名 组织；文件名 ASCII 化）
-  const storagePath = `${id}/${kb.id}/${Date.now()}-${safeStorageName(file.name)}`;
-  await uploadDocumentFile(storagePath, buffer, mime);
-
-  // b. 建 Document 记录（PENDING）
+  // ★ 关键修复：先建 Document 行（PENDING），保证列表一定看得到这次上传。
+  //   旧逻辑是先存 Storage 再建行——一旦 Storage/网络出错，行没建、列表永远空，
+  //   前端只闪一下「上传失败」就消失，表现为「加载完啥也没加」。
   const doc = await prisma.document.create({
     data: {
       kbId: kb.id,
       title: file.name,
-      sourceUrl: storagePath,
       mimeType: mime,
       sizeBytes: buffer.length,
       status: "PENDING",
     },
   });
 
-  // d+e. 同步走完 解析 → 切片 → 向量化 → 入库（详见 lib/rag/process.ts）
-  // 成功 → READY；失败 → FAILED（带明确原因），绝不会卡在 PENDING
-  const result = await processDocument(doc.id);
+  try {
+    // a. 确保 bucket 存在
+    await ensureDocumentsBucket();
 
-  if (result.status === "FAILED") {
-    return NextResponse.json(
-      { error: result.error ?? "文档处理失败" },
-      { status: 500 }
-    );
+    // b. 上传文件到 Storage（路径用 agentId/kbId/时间戳-文件名 组织；文件名 ASCII 化）
+    const storagePath = `${id}/${kb.id}/${Date.now()}-${safeStorageName(file.name)}`;
+    await uploadDocumentFile(storagePath, buffer, mime);
+
+    // 回填源文件路径（processDocument 需要从 Storage 取回源文件）
+    await prisma.document.update({
+      where: { id: doc.id },
+      data: { sourceUrl: storagePath },
+    });
+
+    // d+e. 同步走完 解析 → 切片 → 向量化 → 入库（详见 lib/rag/process.ts）
+    // 成功 → READY；失败 → FAILED（带明确原因），绝不会卡在 PENDING
+    const result = await processDocument(doc.id);
+
+    if (result.status === "FAILED") {
+      // processDocument 内部已把文档标 FAILED + 记录原因，直接返回错误
+      return NextResponse.json(
+        { error: result.error ?? "文档处理失败", documentId: doc.id },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json({
+      success: true,
+      document: {
+        id: doc.id,
+        title: doc.title,
+        status: "READY",
+        chunkCount: result.chunkCount,
+      },
+    });
+  } catch (err) {
+    // Storage 上传 / bucket 创建等前置步骤出错：文档已存在，标 FAILED 让用户看到原因，
+    // 不再静默丢失（列表会显示「失败」+ 具体原因，可点重新处理）。
+    const msg = err instanceof Error ? err.message : "上传或处理失败";
+    await prisma.document
+      .update({ where: { id: doc.id }, data: { status: "FAILED", error: msg } })
+      .catch(() => {});
+    return NextResponse.json({ error: msg, documentId: doc.id }, { status: 500 });
   }
-
-  return NextResponse.json({
-    success: true,
-    document: {
-      id: doc.id,
-      title: doc.title,
-      status: "READY",
-      chunkCount: result.chunkCount,
-    },
-  });
 }
