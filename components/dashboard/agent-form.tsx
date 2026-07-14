@@ -44,6 +44,17 @@ const MODELS = [
   { value: "deepseek-reasoner", label: "DeepSeek Reasoner（深度推理）" },
 ];
 
+// 安全解析响应体：空体或非法 JSON 都返回 null，避免 "Unexpected end of JSON input"
+async function safeParseJson(res: Response): Promise<Record<string, unknown> | null> {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 export function AgentForm({
   agent,
 }: {
@@ -109,9 +120,9 @@ export function AgentForm({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(form),
         });
+        const data = await safeParseJson(res);
         if (!res.ok) {
-          const data = await res.json();
-          throw new Error(data.error || "保存失败");
+          throw new Error(data?.error ? String(data.error) : `保存失败 (HTTP ${res.status})`);
         }
         router.push("/agents");
         router.refresh();
@@ -122,13 +133,17 @@ export function AgentForm({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(form),
         });
+        const data = await safeParseJson(res);
         if (!res.ok) {
-          const data = await res.json();
-          throw new Error(data.error || "创建失败");
+          throw new Error(
+            data?.error ? String(data.error) : `创建失败 (HTTP ${res.status})`
+          );
         }
-        const created = await res.json();
+        if (!data || typeof data.id !== "string") {
+          throw new Error("创建成功但未返回 Agent ID，请返回列表刷新确认");
+        }
         // 创建成功后直接跳到对话页
-        router.push(`/agents/${created.id}/chat`);
+        router.push(`/agents/${data.id}/chat`);
         router.refresh();
       }
     } catch (err) {

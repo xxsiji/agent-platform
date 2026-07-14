@@ -46,57 +46,73 @@ export async function GET() {
 
 // POST /api/agents — 创建 Agent
 export async function POST(request: Request) {
-  const currentUser = await getCurrentUser();
-  if (!currentUser) {
-    return NextResponse.json({ error: "未登录" }, { status: 401 });
-  }
-
-  const body = await request.json();
-
-  // 基本校验：名称必填
-  if (!body.name || typeof body.name !== "string" || body.name.trim().length === 0) {
-    return NextResponse.json({ error: "Agent 名称不能为空" }, { status: 400 });
-  }
-
-  // 创建 Agent，ownerId 绑定当前用户
-  const agent = await prisma.agent.create({
-    data: {
-      ownerId: currentUser.db.id,
-      name: body.name.trim(),
-      description: body.description?.trim() || null,
-      systemPrompt: body.systemPrompt?.trim() || null,
-      model: body.model || "deepseek-chat",
-      temperature: body.temperature ?? 0.7,
-      topP: body.topP ?? 1,
-      maxTokens: body.maxTokens ?? 2048,
-    },
-  });
-
-  // 处理标签：对每个标签名 upsert Tag 记录，然后创建 AgentTag 关联
-  if (body.tags && Array.isArray(body.tags)) {
-    const tagNames = body.tags
-      .map((t: unknown) => (typeof t === "string" ? t.trim() : ""))
-      .filter(Boolean)
-      .slice(0, 5); // 最多 5 个标签
-
-    if (tagNames.length > 0) {
-      // upsert：标签存在就复用，不存在就创建
-      const tagRecords = await Promise.all(
-        tagNames.map((name: string) =>
-          prisma.tag.upsert({
-            where: { name },
-            update: {},
-            create: { name },
-          })
-        )
-      );
-      // 创建 Agent-Tag 关联
-      await prisma.agentTag.createMany({
-        data: tagRecords.map((t) => ({ agentId: agent.id, tagId: t.id })),
-        skipDuplicates: true,
-      });
+  try {
+    const currentUser = await getCurrentUser();
+    if (!currentUser) {
+      return NextResponse.json({ error: "未登录" }, { status: 401 });
     }
-  }
 
-  return NextResponse.json(agent, { status: 201 });
+    // 防御：请求体可能不是合法 JSON（如中间件吞掉 POST body → 空串）
+    let body: any;
+    try {
+      body = await request.json();
+    } catch {
+      return NextResponse.json(
+        { error: "请求体为空或不是合法 JSON（可能是代理层丢失了 POST body）" },
+        { status: 400 }
+      );
+    }
+
+    // 基本校验：名称必填
+    if (!body.name || typeof body.name !== "string" || body.name.trim().length === 0) {
+      return NextResponse.json({ error: "Agent 名称不能为空" }, { status: 400 });
+    }
+
+    // 创建 Agent，ownerId 绑定当前用户
+    const agent = await prisma.agent.create({
+      data: {
+        ownerId: currentUser.db.id,
+        name: body.name.trim(),
+        description: body.description?.trim() || null,
+        systemPrompt: body.systemPrompt?.trim() || null,
+        model: body.model || "deepseek-chat",
+        temperature: body.temperature ?? 0.7,
+        topP: body.topP ?? 1,
+        maxTokens: body.maxTokens ?? 2048,
+      },
+    });
+
+    // 处理标签：对每个标签名 upsert Tag 记录，然后创建 AgentTag 关联
+    if (body.tags && Array.isArray(body.tags)) {
+      const tagNames = body.tags
+        .map((t: unknown) => (typeof t === "string" ? t.trim() : ""))
+        .filter(Boolean)
+        .slice(0, 5); // 最多 5 个标签
+
+      if (tagNames.length > 0) {
+        // upsert：标签存在就复用，不存在就创建
+        const tagRecords = await Promise.all(
+          tagNames.map((name: string) =>
+            prisma.tag.upsert({
+              where: { name },
+              update: {},
+              create: { name },
+            })
+          )
+        );
+        // 创建 Agent-Tag 关联
+        await prisma.agentTag.createMany({
+          data: tagRecords.map((t) => ({ agentId: agent.id, tagId: t.id })),
+          skipDuplicates: true,
+        });
+      }
+    }
+
+    return NextResponse.json(agent, { status: 201 });
+  } catch (err) {
+    // 兜底：任何未捕获异常都返回 JSON 错误体，杜绝空响应导致前端 "Unexpected end of JSON input"
+    console.error("[POST /api/agents] 创建失败:", err);
+    const message = err instanceof Error ? err.message : "创建失败（服务器内部错误）";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
 }
