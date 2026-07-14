@@ -149,28 +149,29 @@ export async function POST(
   });
 
   try {
-    // a. 确保 bucket 存在
-    await ensureDocumentsBucket();
-
-    // b. 上传文件到 Storage（路径用 agentId/kbId/时间戳-文件名 组织；文件名 ASCII 化）
-    const storagePath = `${id}/${kb.id}/${Date.now()}-${safeStorageName(file.name)}`;
-    await uploadDocumentFile(storagePath, buffer, mime);
-
-    // 回填源文件路径（processDocument 需要从 Storage 取回源文件）
-    await prisma.document.update({
-      where: { id: doc.id },
-      data: { sourceUrl: storagePath },
-    });
-
-    // d+e. 同步走完 解析 → 切片 → 向量化 → 入库（详见 lib/rag/process.ts）
-    // 成功 → READY；失败 → FAILED（带明确原因），绝不会卡在 PENDING
-    const result = await processDocument(doc.id);
+    // 主链路：直接用内存 buffer 处理（跳过 Storage 上传/下载）
+    const result = await processDocument(doc.id, buffer);
 
     if (result.status === "FAILED") {
       // processDocument 内部已把文档标 FAILED + 记录原因，直接返回错误
       return NextResponse.json(
         { error: result.error ?? "文档处理失败", documentId: doc.id },
         { status: 500 }
+      );
+    }
+
+    // 旁路：best-effort 把源文件备份到 Storage（失败仅影响「重新处理」，不影响本次）
+    try {
+      await ensureDocumentsBucket();
+      const storagePath = `${id}/${kb.id}/${Date.now()}-${safeStorageName(file.name)}`;
+      await uploadDocumentFile(storagePath, buffer, mime);
+      await prisma.document
+        .update({ where: { id: doc.id }, data: { sourceUrl: storagePath } })
+        .catch(() => {});
+    } catch (storageErr) {
+      console.warn(
+        "[RAG] 源文件备份到 Storage 失败（忽略，不影响本次上传）:",
+        storageErr instanceof Error ? storageErr.message : storageErr
       );
     }
 
@@ -184,8 +185,7 @@ export async function POST(
       },
     });
   } catch (err) {
-    // Storage 上传 / bucket 创建等前置步骤出错：文档已存在，标 FAILED 让用户看到原因，
-    // 不再静默丢失（列表会显示「失败」+ 具体原因，可点重新处理）。
+    // 兜底：processDocument 之外的意外（极少见），文档已存在，标 FAILED 让用户看到原因
     const msg = err instanceof Error ? err.message : "上传或处理失败";
     await prisma.document
       .update({ where: { id: doc.id }, data: { status: "FAILED", error: msg } })

@@ -11,8 +11,8 @@ import { downloadDocumentFile } from "./files";
  *
  * 1. 全程在调用方请求内【同步】完成（MVP 文档不大，同步足够且最可靠），
  *    不会出现「后台 job 因进程退出而丢失」的问题。
- * 2. 源文件在调用前已先存进 Supabase Storage，本函数从 Storage 取回，
- *    因此「重新处理」可复用同一份源文件，不需要再传一次。
+ * 2. 主链路（上传接口）直接把内存里的 buffer 传进来，不依赖 Supabase Storage，
+ *    最稳；「重新处理」接口没有 buffer，才从 Storage 取回源文件。
  * 3. 进入前先把旧向量清掉（storeDocumentEmbeddings 内部 deleteMany），
  *    保证可重复执行（幂等）。
  * 4. 任何一步失败都会落到 catch，把 Document 标 FAILED 并记下【明确原因】，
@@ -54,7 +54,8 @@ export type ProcessResult = {
  * @returns 处理结果（status / chunkCount / error）
  */
 export async function processDocument(
-  documentId: string
+  documentId: string,
+  buffer?: Buffer
 ): Promise<ProcessResult> {
   // 取文档元信息（sourceUrl / mimeType）
   const doc = await prisma.document.findUnique({ where: { id: documentId } });
@@ -69,12 +70,13 @@ export async function processDocument(
   });
 
   try {
-    // 从 Storage 取回源文件（上传 / 重新处理 走同一条路径）
-    const buffer = await downloadDocumentFile(doc.sourceUrl ?? "");
+    // 主链路优先用调用方直接传入的内存 buffer（上传接口，避免绕 Supabase Storage）；
+    // 未传入时（重新处理接口）才从 Storage 取回源文件。
+    const buf = buffer ?? (await downloadDocumentFile(doc.sourceUrl ?? ""));
 
     // 1. 解析
     const text = await withTimeout(
-      Promise.resolve(parseDocument(buffer, doc.mimeType)),
+      Promise.resolve(parseDocument(buf, doc.mimeType)),
       PARSE_TIMEOUT_MS,
       "解析"
     );
