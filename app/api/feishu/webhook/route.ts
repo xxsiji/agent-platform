@@ -3,10 +3,17 @@
  *
  * 处理流程：
  *   1. url_verification 握手 → 立即返回 challenge
- *   2. im.message.receive_v1 文本消息 → 同步调 DeepSeek → 回写飞书 → 返回 200
+ *   2. im.message.receive_v1 文本消息 → 解析后【立即返回 200 (ack)】，重型处理放后台异步跑
+ *      - 后台：查 Agent/RAG → 调 DeepSeek → 主动调飞书发消息 API 推回群
+ *      - 满足飞书 3 秒响应要求，不会因 LLM 慢而触发重试刷屏
  *
- * 说明：本地/生产统一用 Node Runtime 同步处理。飞书对"消息事件"的超时比 url_verification
- * 宽松得多，同步 await 处理完再返回最稳，也便于打日志排查。
+ * 关键设计：fire-and-forget（不 await 重活，先 ack）
+ *   - 飞书要求 3 秒内收到 200，否则同一条消息重试 3 次 → 群刷多条
+ *   - 现在 webhook 毫秒级返回 200，杜绝重试；回复走"主动发消息 API"推回，与接收解耦
+ *
+ * 注意（Serverless  caveat）：Vercel 在响应返回后可能冻结函数，低流量 demo 可接受。
+ * 生产建议用 @vercel/functions 的 waitUntil 或任务队列（Inngest / Upstash QStash）
+ * 保证后台任务一定跑完。
  */
 export const runtime = "nodejs";
 export const maxDuration = 30;
@@ -44,6 +51,64 @@ interface FeishuEventPayload {
   };
 }
 
+/**
+ * 重型处理：抽成独立函数，POST 里不 await（fire-and-forget）
+ * 飞书收到 200 后，这里在后台跑：RAG 检索 + 调 DeepSeek + 主动回群
+ */
+async function handleFeishuMessage(data: { cleanText: string; chatId: string }) {
+  const { cleanText, chatId } = data;
+  try {
+    // 构造 system prompt：
+    //  - 配了 FEISHU_AGENT_SLUG → 查平台公开 Agent，走 RAG 知识库（有知识库则检索注入）
+    //  - 没配 / Agent 不存在 / Supabase 挂了 → 降级到默认 prompt，机器人仍能答通用问题
+    let systemPrompt =
+      "你是一个简洁、专业的 AI 助手。回答控制在 300 字以内，除非用户要求详细说明。";
+    let modelId = "deepseek-chat";
+    const slug = process.env.FEISHU_AGENT_SLUG;
+    if (slug) {
+      try {
+        const agent = await prisma.agent.findUnique({
+          where: { shareSlug: slug },
+        });
+        if (agent && agent.visibility === "PUBLIC" && !agent.deletedAt) {
+          systemPrompt = await buildSystemPromptWithRag(
+            agent.id,
+            agent.systemPrompt,
+            cleanText,
+            agent.enableKnowledge
+          );
+          if (agent.model) modelId = agent.model;
+        }
+      } catch (ragErr) {
+        console.error("[feishu] RAG lookup failed, fallback default:", ragErr);
+      }
+    }
+
+    const { text: reply } = await generateText({
+      model: deepseek.chat(modelId),
+      system: systemPrompt || undefined,
+      messages: [{ role: "user", content: cleanText }],
+      temperature: 0.7,
+    });
+    console.log("[feishu] deepseek reply:", reply.slice(0, 200));
+
+    await sendTextMessage(chatId, reply, "chat_id");
+    console.log("[feishu] reply sent to chat:", chatId);
+  } catch (err) {
+    console.error("[feishu] handle message failed:", err);
+    // 出错也尝试给用户一个提示，方便定位
+    try {
+      await sendTextMessage(
+        chatId,
+        "（机器人处理出错了，请稍后再试）",
+        "chat_id"
+      );
+    } catch (e) {
+      console.error("[feishu] send error notice failed:", e);
+    }
+  }
+}
+
 export async function POST(request: Request) {
   let body: FeishuEventPayload;
   try {
@@ -55,7 +120,7 @@ export async function POST(request: Request) {
 
   console.log("[feishu] incoming:", JSON.stringify(body).slice(0, 800));
 
-  // 1. 飞书握手验证
+  // 1. 飞书握手验证（必须同步立即返回）
   if (body.type === "url_verification" && body.challenge) {
     console.log("[feishu] url_verification challenge:", body.challenge);
     return Response.json({ challenge: body.challenge });
@@ -92,57 +157,13 @@ export async function POST(request: Request) {
     const cleanText = rawText.replace(/@\S+/g, "").trim() || "你好";
     console.log("[feishu] user text:", cleanText, "chatId:", chatId);
 
-    try {
-      // 构造 system prompt：
-      //  - 配了 FEISHU_AGENT_SLUG → 查平台公开 Agent，走 RAG 知识库（有知识库则检索注入）
-      //  - 没配 / Agent 不存在 / Supabase 挂了 → 降级到默认 prompt，机器人仍能答通用问题
-      let systemPrompt =
-        "你是一个简洁、专业的 AI 助手。回答控制在 300 字以内，除非用户要求详细说明。";
-      let modelId = "deepseek-chat";
-      const slug = process.env.FEISHU_AGENT_SLUG;
-      if (slug) {
-        try {
-          const agent = await prisma.agent.findUnique({
-            where: { shareSlug: slug },
-          });
-          if (agent && agent.visibility === "PUBLIC" && !agent.deletedAt) {
-            systemPrompt = await buildSystemPromptWithRag(
-              agent.id,
-              agent.systemPrompt,
-              cleanText,
-              agent.enableKnowledge
-            );
-            if (agent.model) modelId = agent.model;
-          }
-        } catch (ragErr) {
-          console.error("[feishu] RAG lookup failed, fallback default:", ragErr);
-        }
-      }
-
-      const { text: reply } = await generateText({
-        model: deepseek.chat(modelId),
-        system: systemPrompt || undefined,
-        messages: [{ role: "user", content: cleanText }],
-        temperature: 0.7,
-      });
-      console.log("[feishu] deepseek reply:", reply.slice(0, 200));
-
-      await sendTextMessage(chatId, reply, "chat_id");
-      console.log("[feishu] reply sent to chat:", chatId);
-    } catch (err) {
-      console.error("[feishu] handle message failed:", err);
-      // 出错也尝试给用户一个提示，方便定位
-      try {
-        await sendTextMessage(
-          chatId,
-          "（机器人处理出错了，请稍后再试）",
-          "chat_id"
-        );
-      } catch (e) {
-        console.error("[feishu] send error notice failed:", e);
-      }
-    }
+    // ★ 关键改动：fire-and-forget，不 await 重型处理
+    // 立即把任务丢到后台，webhook 毫秒级返回 200（ack），杜绝飞书 3 秒超时重试
+    handleFeishuMessage({ cleanText, chatId }).catch((err) =>
+      console.error("[feishu] background task error:", err)
+    );
   }
 
+  // 立即返回 200（ack），不等 LLM 跑完
   return Response.json({ code: 0 });
 }
