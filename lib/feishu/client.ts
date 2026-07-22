@@ -86,3 +86,38 @@ export async function sendTextMessage(
     throw new Error(`飞书发送消息失败: ${data.code} ${data.msg}`);
   }
 }
+
+/**
+ * 更新多维表（bitable）中的一条记录字段
+ *
+ * 飞书多维表自动化「调用网页」触发后，我们用这个把 AI 生成的结果写回业务表，
+ * 形成"业务表变化 → AI 处理 → 结果落回业务表"的完整闭环。
+ *
+ * @param appToken  多维表 app_token（在表 URL 里，bAxxxxx 或 应用 app_token）
+ * @param tableId   数据表 ID（tblxxxx，在表 URL 里）
+ * @param recordId 记录 ID（多维表自动化 webhook 会带上）
+ * @param fields    要写回的字段键值对，如 { "AI话术": "..." }
+ */
+export async function updateBitableRecord(
+  appToken: string,
+  tableId: string,
+  recordId: string,
+  fields: Record<string, unknown>
+): Promise<void> {
+  const token = await getTenantAccessToken();
+  const res = await fetch(
+    `${FEISHU_BASE}/bitable/v1/apps/${appToken}/tables/${tableId}/records/${recordId}`,
+    {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ fields }),
+    }
+  );
+  const data = (await res.json()) as { code: number; msg: string };
+  if (data.code !== 0) {
+    throw new Error(`飞书多维表写回失败: ${data.code} ${data.msg}`);
+  }
+}
