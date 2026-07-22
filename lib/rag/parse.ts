@@ -1,14 +1,17 @@
-import { PDFParse } from "pdf-parse";
-
 /**
  * 文档解析模块。
  *
  * RAG 管线的第一环：把上传的文件（Buffer）转成纯文本字符串。
  * MVP 只支持 txt 和 pdf，docx 以后再加。
  *
- * 注意：项目安装的是 pdf-parse v2（ESM 重写版），API 是 `PDFParse` 类，
- * 不再是 v1 的 `pdfParse(buffer)` 函数式调用。
+ * 重要修复（2026-07-22）：
+ * 旧实现用 pdf-parse，在 Vercel Node runtime 加载即崩
+ * （v2 依赖浏览器 DOMMatrix；v1 又强制读自带测试 PDF 导致 ENOENT），
+ * 整个 /documents 路由 500。现改用 unpdf——专为 Node/Serverless 设计、
+ * 无 DOM 依赖，且 PDF 解析仅在上传 pdf 时才动态加载，不连累 .txt 与列表。
  */
+
+import { extractText, getDocumentProxy } from "unpdf";
 
 /**
  * 解析纯文本：txt 直接按 UTF-8 解码即可。
@@ -18,21 +21,21 @@ export function parseTxt(buffer: Buffer): string {
 }
 
 /**
- * 解析 PDF：用 pdf-parse 的 PDFParse 类抽取正文文本。
+ * 解析 PDF：用 unpdf 抽取正文文本（Serverless 安全，无 DOMMatrix 依赖）。
  */
 export async function parsePdf(buffer: Buffer): Promise<string> {
-  // pdf-parse v2：传入二进制数据，调用 getText() 拿纯文本
-  const parser = new PDFParse({ data: buffer });
   try {
-    const result = await parser.getText();
-    return result.text || "";
+    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { text } = await extractText(pdf, { mergePages: true });
+    const clean = (text || "").toString();
+    if (!clean.trim()) {
+      throw new Error("PDF 解析结果为空，可能是扫描件或加密 PDF");
+    }
+    return clean;
   } catch (err) {
     // 解析失败（加密 / 损坏 / 编码问题等）→ 抛清晰错误，由上层标 FAILED
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`PDF 解析失败：${msg}`);
-  } finally {
-    // 释放 worker / 内部资源，避免内存泄漏（destroy 自身也兜底）
-    await parser.destroy().catch(() => {});
   }
 }
 
