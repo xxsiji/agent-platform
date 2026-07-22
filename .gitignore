@@ -57,3 +57,9 @@ qa-artifacts/
 .workbuddy/
 DEVLOG.md
 TODO.md
+
+.vercel
+.env*
+
+# 本地备份目录（不要上传到 Vercel，否则部署包会超 1GB 导致上传中断）
+/.next_bak/

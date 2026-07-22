@@ -6,6 +6,9 @@ import { getExploreData } from "@/lib/queries/explore";
 import { ExploreAuthNav } from "@/components/explore/explore-auth-nav";
 import { ExploreClient } from "@/components/explore/explore-client";
 
+// 运行时动态渲染：避免 build 时静态预渲染去连数据库（Vercel build 环境连 Supabase 不稳定）
+export const dynamic = "force-dynamic";
+
 /**
  * 探索广场页面（免登录）。
  *

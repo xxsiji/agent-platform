@@ -1,0 +1,18 @@
+# 依赖与构建产物（不要上传到 Vercel，否则部署包会超 1GB 导致上传中断）
+node_modules
+.next
+.next_bak
+.vercel
+.git
+out
+build
+coverage
+
+# 环境变量（含密钥，绝不上传；Vercel 用项目控制台配置的环境变量）
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+npm-debug.log*

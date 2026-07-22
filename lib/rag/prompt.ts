@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { searchKnowledge } from "./retrieval";
 import { buildRagContext } from "./context";
+import { rewriteQuery } from "./query-rewrite";
 
 /**
  * 构造「带 RAG 知识的 system prompt」。
@@ -40,8 +41,10 @@ export async function buildSystemPromptWithRag(
     return baseSystemPrompt || "";
   }
 
-  // 有知识库 → 检索 + 拼接
-  const chunks = await searchKnowledge(agentId, userQuery, 5);
+  // 有知识库 → 查询改写（提升检索准确率）+ 检索 + 拼接
+  // rewriteQuery 失败会自动降级为原 query，不影响主流程
+  const searchQuery = await rewriteQuery(userQuery);
+  const chunks = await searchKnowledge(agentId, searchQuery, 5);
   const ragContext = buildRagContext(chunks);
 
   if (!ragContext) {
